@@ -1,0 +1,1225 @@
+import os
+import json
+import math
+import itertools
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import t as student_t
+
+# ============================================================
+# Output directory
+# ============================================================
+DESKTOP = os.path.expanduser("~/Desktop")
+OUTDIR = os.path.join(DESKTOP, "three_factor_full_results_improved")
+os.makedirs(OUTDIR, exist_ok=True)
+
+# ============================================================
+# Baseline parameters
+# ============================================================
+TAU_X = 0.02
+TAU_A_ON = 0.20
+W0 = 1.2
+C_ON = 0.8
+ALPHA_ON = 0.10
+G_ON = 0.5
+GAMMA = 4.0
+THETA = 0.5
+TAU_DELAY = 0.05
+A_IN = 1.0
+F0 = 5.0
+SIGMA_ADD = 0.02
+
+DT = 0.001
+T_TOTAL = 30.0
+T_BURN = 5.0
+N_TRIALS = 50
+BOOT_N = 500
+BASE_SEED = 20260410
+
+DELTA_F_VALUES = np.logspace(-2, 1, 13)
+REPRESENTATIVE_DELTA_F = 0.1
+
+ALPHA_SWEEP = [0.05, 0.10, 0.15, 0.20]
+G_SWEEP = [0.2, 0.5, 0.8, 1.0]
+TAU_A_SWEEP = [0.05, 0.10, 0.20, 0.30]
+C_SWEEP = [0.5, 0.65, 0.8, 1.0]
+
+REGIME_BINS = {
+    "low": (-2.0, -1.0),
+    "mid": (-1.0, 0.0),
+    "high": (0.0, 1.0),
+}
+
+MAIN_FOUR = {
+    "Full": "A1_G1_T1",
+    "NoAsym": "A0_G1_T1",
+    "NoAdapt": "A1_G0_T1",
+    "NoTSsep": "A1_G1_T0",
+}
+
+# ============================================================
+# Utilities
+# ============================================================
+@dataclass(frozen=True)
+class Condition:
+    asymmetry: int
+    adaptation: int
+    timescale_separation: int
+
+    def name(self) -> str:
+        return f"A{self.asymmetry}_G{self.adaptation}_T{self.timescale_separation}"
+
+    def label(self) -> str:
+        parts = [
+            "Asym" if self.asymmetry else "Sym",
+            "Adapt" if self.adaptation else "NoAdapt",
+            "TSsep" if self.timescale_separation else "NoTSsep",
+        ]
+        return ", ".join(parts)
+
+
+def sigmoid(u):
+    return 1.0 / (1.0 + np.exp(-GAMMA * (u - THETA)))
+
+
+def analytic_signal(x: np.ndarray) -> np.ndarray:
+    n = len(x)
+    Xf = np.fft.fft(x)
+    h = np.zeros(n)
+    if n % 2 == 0:
+        h[0] = 1
+        h[n // 2] = 1
+        h[1:n // 2] = 2
+    else:
+        h[0] = 1
+        h[1:(n + 1) // 2] = 2
+    return np.fft.ifft(Xf * h)
+
+
+def bootstrap_ci(values: np.ndarray, n_boot: int = 500, ci: float = 95.0, seed: int = 1234):
+    rng = np.random.default_rng(seed)
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    boots = np.empty(n_boot)
+    for i in range(n_boot):
+        sample = rng.choice(values, size=n, replace=True)
+        boots[i] = sample.mean()
+    low = np.percentile(boots, (100 - ci) / 2)
+    high = np.percentile(boots, 100 - (100 - ci) / 2)
+    return float(low), float(high)
+
+
+def r2_score(y, yhat):
+    y = np.asarray(y, dtype=float)
+    yhat = np.asarray(yhat, dtype=float)
+    ss_res = np.sum((y - yhat) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+
+def trial_seed(*parts) -> int:
+    return BASE_SEED + (hash(parts) % 10_000_000)
+
+
+def local_slopes(x: np.ndarray, y: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mids = 0.5 * (x[:-1] + x[1:])
+    slopes = np.diff(y) / np.diff(x)
+    return mids, slopes
+
+
+def turning_points(x: np.ndarray, y: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    dy = np.diff(y)
+    signs = np.sign(dy)
+    out = []
+    for i in range(1, len(signs)):
+        if signs[i - 1] > 0 and signs[i] < 0:
+            out.append({"type": "local_max", "x": float(x[i]), "y": float(y[i]), "index": int(i)})
+        elif signs[i - 1] < 0 and signs[i] > 0:
+            out.append({"type": "local_min", "x": float(x[i]), "y": float(y[i]), "index": int(i)})
+    return out
+
+
+def piecewise_linear_two_segment(x: np.ndarray, y: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    best = None
+    for split in range(2, len(x) - 2):
+        x1, y1 = x[:split + 1], y[:split + 1]
+        x2, y2 = x[split:], y[split:]
+        c1 = np.polyfit(x1, y1, 1)
+        c2 = np.polyfit(x2, y2, 1)
+        yhat1 = np.polyval(c1, x1)
+        yhat2 = np.polyval(c2, x2)
+        sse = np.sum((y1 - yhat1) ** 2) + np.sum((y2 - yhat2) ** 2)
+        if best is None or sse < best["sse"]:
+            yhat = np.concatenate([yhat1[:-1], yhat2])
+            best = {
+                "split_index": split,
+                "split_x": float(x[split]),
+                "coef1": c1,
+                "coef2": c2,
+                "sse": float(sse),
+                "r2": r2_score(y, yhat),
+                "yhat": yhat,
+            }
+    return best
+
+
+def longest_contiguous_true(mask: np.ndarray) -> int:
+    max_len = 0
+    cur = 0
+    for v in mask:
+        if v:
+            cur += 1
+            max_len = max(max_len, cur)
+        else:
+            cur = 0
+    return max_len
+
+
+def mean_sem(x):
+    x = np.asarray(x, dtype=float)
+    return float(np.mean(x)), float(np.std(x, ddof=1) / np.sqrt(len(x)))
+
+
+# ============================================================
+# Phase metrics
+# ============================================================
+def phase_metrics_from_signals(x_l: np.ndarray, x_r: np.ndarray, dt: float):
+    z_l = analytic_signal(x_l)
+    z_r = analytic_signal(x_r)
+
+    phi_l_wrapped = np.angle(z_l)
+    phi_r_wrapped = np.angle(z_r)
+
+    phi_l = np.unwrap(phi_l_wrapped)
+    phi_r = np.unwrap(phi_r_wrapped)
+
+    delta_phi = np.angle(np.exp(1j * (phi_l - phi_r)))
+    delta_phi_u = np.unwrap(phi_l - phi_r)
+
+    z = np.exp(1j * delta_phi).mean()
+    plv = float(np.abs(z))
+    mean_phase_lag = float(np.abs(np.angle(z)))
+    signed_mean_phase_lag = float(np.angle(z))
+
+    r = max(min(plv, 1.0), 1e-12)
+    circ_sd = float(np.sqrt(-2.0 * np.log(r)))
+
+    if len(delta_phi_u) >= 2:
+        domega_eff_ts = np.diff(delta_phi_u) / dt
+        mean_domega_eff = float(np.mean(domega_eff_ts))
+    else:
+        domega_eff_ts = np.array([], dtype=float)
+        mean_domega_eff = np.nan
+
+    t_vec = np.arange(len(delta_phi_u), dtype=float) * dt
+    if len(delta_phi_u) > 0:
+        psi = delta_phi_u - mean_domega_eff * t_vec
+        T_an = len(delta_phi_u) * dt
+        D_phi = float(np.var(psi, ddof=1) / (2.0 * T_an)) if len(psi) >= 2 else np.nan
+    else:
+        psi = np.array([], dtype=float)
+        T_an = 0.0
+        D_phi = np.nan
+
+    cycle_index = np.floor(delta_phi_u / (2.0 * np.pi))
+    if len(cycle_index) >= 2:
+        slip_jumps = np.diff(cycle_index)
+        N_slip = int(np.sum(np.abs(slip_jumps) > 0))
+    else:
+        N_slip = 0
+
+    r_slip = float(N_slip / T_an) if T_an > 0 else np.nan
+
+    return {
+        "plv": plv,
+        "mean_phase_lag": mean_phase_lag,
+        "signed_mean_phase_lag": signed_mean_phase_lag,
+        "circ_sd": circ_sd,
+        "mean_domega_eff": mean_domega_eff,
+        "D_phi": D_phi,
+        "N_slip": N_slip,
+        "r_slip": r_slip,
+        "delta_phi": delta_phi,
+        "delta_phi_u": delta_phi_u,
+        "phi_l": phi_l,
+        "phi_r": phi_r,
+        "domega_eff_ts": domega_eff_ts,
+    }
+
+
+# ============================================================
+# Simulation
+# ============================================================
+def simulate_condition(
+    cond: Condition,
+    delta_f: float,
+    seed: int,
+    tau_x: float = TAU_X,
+    tau_a_on: float = TAU_A_ON,
+    w0: float = W0,
+    c_on: float = C_ON,
+    alpha_on: float = ALPHA_ON,
+    g_on: float = G_ON,
+    tau_delay: float = TAU_DELAY,
+    a_in: float = A_IN,
+    f0: float = F0,
+    sigma_add: float = SIGMA_ADD,
+    dt: float = DT,
+    t_total: float = T_TOTAL,
+    t_burn: float = T_BURN,
+):
+    rng = np.random.default_rng(seed)
+    n_steps = int(round(t_total / dt))
+    burn_steps = int(round(t_burn / dt))
+    t = np.arange(n_steps, dtype=float) * dt
+
+    alpha = alpha_on if cond.asymmetry else 0.0
+    g = g_on if cond.adaptation else 0.0
+    tau_a = tau_a_on if cond.timescale_separation else tau_x
+
+    w_ll = w0 * (1.0 + alpha)
+    w_rr = w0 * (1.0 - alpha)
+    delay_steps = max(1, int(round(tau_delay / dt)))
+
+    x_l = np.zeros(n_steps, dtype=float)
+    x_r = np.zeros(n_steps, dtype=float)
+    a_l = np.zeros(n_steps, dtype=float)
+    a_r = np.zeros(n_steps, dtype=float)
+
+    x_l[:delay_steps + 1] = 0.05 + 0.01 * rng.standard_normal(delay_steps + 1)
+    x_r[:delay_steps + 1] = 0.05 + 0.01 * rng.standard_normal(delay_steps + 1)
+    a_l[:delay_steps + 1] = 0.02 + 0.01 * rng.standard_normal(delay_steps + 1)
+    a_r[:delay_steps + 1] = 0.02 + 0.01 * rng.standard_normal(delay_steps + 1)
+
+    f_l = f0 - delta_f / 2.0
+    f_r = f0 + delta_f / 2.0
+
+    for i in range(delay_steps, n_steps - 1):
+        i_l = a_in * math.sin(2.0 * math.pi * f_l * t[i])
+        i_r = a_in * math.sin(2.0 * math.pi * f_r * t[i])
+
+        u_l = w_ll * x_l[i] - g * a_l[i] + c_on * x_r[i - delay_steps] + i_l
+        u_r = w_rr * x_r[i] - g * a_r[i] + c_on * x_l[i - delay_steps] + i_r
+
+        noise_l = sigma_add * math.sqrt(dt) * rng.standard_normal()
+        noise_r = sigma_add * math.sqrt(dt) * rng.standard_normal()
+
+        dx_l = (-x_l[i] + sigmoid(u_l)) / tau_x
+        dx_r = (-x_r[i] + sigmoid(u_r)) / tau_x
+        da_l = (-a_l[i] + x_l[i]) / tau_a
+        da_r = (-a_r[i] + x_r[i]) / tau_a
+
+        x_l[i + 1] = x_l[i] + dx_l * dt + noise_l
+        x_r[i + 1] = x_r[i] + dx_r * dt + noise_r
+        a_l[i + 1] = a_l[i] + da_l * dt
+        a_r[i + 1] = a_r[i] + da_r * dt
+
+    x_l_ss = x_l[burn_steps:]
+    x_r_ss = x_r[burn_steps:]
+    time_ss = t[burn_steps:]
+
+    metrics = phase_metrics_from_signals(x_l_ss, x_r_ss, dt)
+    metrics.update(
+        {
+            "condition": cond.name(),
+            "condition_label": cond.label(),
+            "delta_f": float(delta_f),
+            "log10_delta_f": float(np.log10(delta_f)),
+            "x_l_ss": x_l_ss,
+            "x_r_ss": x_r_ss,
+            "time_ss": time_ss,
+        }
+    )
+    return metrics
+
+
+# ============================================================
+# Main analysis
+# ============================================================
+def run_main_analysis():
+    conditions = [Condition(a, g, t) for a, g, t in itertools.product([0, 1], repeat=3)]
+
+    trial_rows = []
+    representative = None
+    total_jobs = len(conditions) * len(DELTA_F_VALUES) * N_TRIALS
+    done = 0
+
+    for cond in conditions:
+        for delta_f in DELTA_F_VALUES:
+            for trial in range(N_TRIALS):
+                seed = trial_seed("main", cond.name(), float(delta_f), trial)
+                res = simulate_condition(cond, float(delta_f), seed)
+
+                trial_rows.append(
+                    {
+                        "condition": cond.name(),
+                        "condition_label": cond.label(),
+                        "asymmetry": cond.asymmetry,
+                        "adaptation": cond.adaptation,
+                        "timescale_separation": cond.timescale_separation,
+                        "delta_f": float(delta_f),
+                        "log10_delta_f": float(np.log10(delta_f)),
+                        "trial": int(trial),
+                        "plv": res["plv"],
+                        "mean_phase_lag": res["mean_phase_lag"],
+                        "signed_mean_phase_lag": res["signed_mean_phase_lag"],
+                        "circ_sd": res["circ_sd"],
+                        "mean_domega_eff": res["mean_domega_eff"],
+                        "D_phi": res["D_phi"],
+                        "N_slip": res["N_slip"],
+                        "r_slip": res["r_slip"],
+                    }
+                )
+
+                if cond == Condition(1, 1, 1) and abs(delta_f - REPRESENTATIVE_DELTA_F) < 1e-12 and trial == 0:
+                    representative = res
+
+                done += 1
+                if done % 100 == 0 or done == total_jobs:
+                    print(f"Main analysis: {done}/{total_jobs}")
+
+    trial_df = pd.DataFrame(trial_rows)
+    trial_df.to_csv(os.path.join(OUTDIR, "condition_trial_metrics.csv"), index=False)
+
+    summary_df = (
+        trial_df.groupby(
+            ["condition", "condition_label", "asymmetry", "adaptation", "timescale_separation", "delta_f", "log10_delta_f"],
+            as_index=False,
+        )
+        .agg(
+            plv_mean=("plv", "mean"),
+            plv_sem=("plv", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            lag_mean=("mean_phase_lag", "mean"),
+            lag_sem=("mean_phase_lag", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            signed_lag_mean=("signed_mean_phase_lag", "mean"),
+            signed_lag_sem=("signed_mean_phase_lag", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            circ_sd_mean=("circ_sd", "mean"),
+            circ_sd_sem=("circ_sd", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            mean_domega_eff_mean=("mean_domega_eff", "mean"),
+            mean_domega_eff_sem=("mean_domega_eff", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            D_phi_mean=("D_phi", "mean"),
+            D_phi_sem=("D_phi", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            N_slip_mean=("N_slip", "mean"),
+            N_slip_sem=("N_slip", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+            r_slip_mean=("r_slip", "mean"),
+            r_slip_sem=("r_slip", lambda x: np.std(x, ddof=1) / np.sqrt(len(x))),
+        )
+    )
+    summary_df.to_csv(os.path.join(OUTDIR, "condition_mismatch_summary.csv"), index=False)
+
+    sens_rows = []
+    for cond_name, sub in trial_df.groupby("condition"):
+        meta = sub.iloc[0]
+        for trial, ts in sub.groupby("trial"):
+            ts = ts.sort_values("delta_f")
+            x = np.log10(ts["delta_f"].values)
+
+            metrics = {
+                "LAG": ts["mean_phase_lag"].values,
+                "PLV": ts["plv"].values,
+                "DOMEGA": ts["mean_domega_eff"].values,
+                "DPHI": ts["D_phi"].values,
+                "RSLIP": ts["r_slip"].values,
+            }
+
+            row = {
+                "condition": cond_name,
+                "condition_label": meta["condition_label"],
+                "asymmetry": int(meta["asymmetry"]),
+                "adaptation": int(meta["adaptation"]),
+                "timescale_separation": int(meta["timescale_separation"]),
+                "trial": int(trial),
+            }
+
+            for key, y in metrics.items():
+                coef = np.polyfit(x, y, 1)
+                pred = np.polyval(coef, x)
+                row[f"S_{key}"] = float(coef[0])
+                row[f"R2_{key}"] = float(r2_score(y, pred))
+
+            sens_rows.append(row)
+
+    sens_df = pd.DataFrame(sens_rows)
+    sens_df.to_csv(os.path.join(OUTDIR, "trialwise_sensitivity_metrics.csv"), index=False)
+
+    condition_rows = []
+    for cond_name, sub in sens_df.groupby("condition"):
+        meta = sub.iloc[0]
+
+        ci_map = {}
+        for key in ["LAG", "PLV", "DOMEGA", "DPHI", "RSLIP"]:
+            ci_map[key] = bootstrap_ci(sub[f"S_{key}"].values, n_boot=BOOT_N, seed=trial_seed(f"{key}_ci", cond_name))
+
+        baseline = summary_df[
+            (summary_df["condition"] == cond_name) & (np.isclose(summary_df["delta_f"], REPRESENTATIVE_DELTA_F))
+        ].iloc[0]
+
+        row = {
+            "condition": cond_name,
+            "condition_label": meta["condition_label"],
+            "asymmetry": int(meta["asymmetry"]),
+            "adaptation": int(meta["adaptation"]),
+            "timescale_separation": int(meta["timescale_separation"]),
+            "PLV_at_0p1Hz": float(baseline["plv_mean"]),
+            "LAG_at_0p1Hz": float(baseline["lag_mean"]),
+            "DOMEGA_at_0p1Hz": float(baseline["mean_domega_eff_mean"]),
+            "DPHI_at_0p1Hz": float(baseline["D_phi_mean"]),
+            "RSLIP_at_0p1Hz": float(baseline["r_slip_mean"]),
+        }
+
+        for key in ["LAG", "PLV", "DOMEGA", "DPHI", "RSLIP"]:
+            row[f"S_{key}_mean"] = float(sub[f"S_{key}"].mean())
+            row[f"S_{key}_CI_low"] = float(ci_map[key][0])
+            row[f"S_{key}_CI_high"] = float(ci_map[key][1])
+            row[f"R2_{key}_mean"] = float(sub[f"R2_{key}"].mean())
+
+        condition_rows.append(row)
+
+    condition_df = pd.DataFrame(condition_rows).sort_values(["asymmetry", "adaptation", "timescale_separation"])
+    condition_df.to_csv(os.path.join(OUTDIR, "condition_sensitivity_summary.csv"), index=False)
+    condition_df.to_csv(os.path.join(OUTDIR, "results_table_main.csv"), index=False)
+
+    factor_rows = []
+    for metric in ["S_LAG", "S_PLV", "S_DOMEGA", "S_DPHI", "S_RSLIP"]:
+        for factor in ["asymmetry", "adaptation", "timescale_separation"]:
+            on_vals = sens_df.loc[sens_df[factor] == 1, metric].values
+            off_vals = sens_df.loc[sens_df[factor] == 0, metric].values
+            factor_rows.append(
+                {
+                    "metric": metric,
+                    "factor": factor,
+                    "mean_on": float(np.mean(on_vals)),
+                    "mean_off": float(np.mean(off_vals)),
+                    "effect_on_minus_off": float(np.mean(on_vals) - np.mean(off_vals)),
+                }
+            )
+    factor_df = pd.DataFrame(factor_rows)
+    factor_df.to_csv(os.path.join(OUTDIR, "factor_effects_summary.csv"), index=False)
+
+    return trial_df, summary_df, sens_df, condition_df, factor_df, representative
+
+
+# ============================================================
+# Nonlinear analyses
+# ============================================================
+def run_nonlinear_analyses(summary_df, trial_df):
+    local_rows = []
+    turning_rows = []
+    regime_rows = []
+    model_compare_rows = []
+
+    metrics_to_analyze = {
+        "lag_mean": "lag_mean",
+        "plv_mean": "plv_mean",
+        "mean_domega_eff_mean": "mean_domega_eff_mean",
+        "D_phi_mean": "D_phi_mean",
+        "r_slip_mean": "r_slip_mean",
+    }
+
+    for cond_name, sub in summary_df.groupby("condition"):
+        sub = sub.sort_values("log10_delta_f")
+        x = sub["log10_delta_f"].values
+        label = sub["condition_label"].iloc[0]
+
+        for metric_label, col in metrics_to_analyze.items():
+            y = sub[col].values
+
+            mids, slopes = local_slopes(x, y)
+            for xm, sl in zip(mids, slopes):
+                local_rows.append(
+                    {
+                        "condition": cond_name,
+                        "condition_label": label,
+                        "metric": metric_label,
+                        "mid_log10_delta_f": float(xm),
+                        "local_slope": float(sl),
+                    }
+                )
+
+            for tp in turning_points(x, y):
+                turning_rows.append(
+                    {
+                        "condition": cond_name,
+                        "condition_label": label,
+                        "metric": metric_label,
+                        "turn_type": tp["type"],
+                        "log10_delta_f": tp["x"],
+                        "value": tp["y"],
+                        "index": tp["index"],
+                    }
+                )
+
+            for regime_name, (lo, hi) in REGIME_BINS.items():
+                if regime_name == "low":
+                    mask = (x >= lo) & (x <= hi)
+                else:
+                    mask = (x > lo) & (x <= hi)
+                if mask.sum() >= 3:
+                    xr = x[mask]
+                    yr = y[mask]
+                    coef = np.polyfit(xr, yr, 1)
+                    regime_rows.append(
+                        {
+                            "condition": cond_name,
+                            "condition_label": label,
+                            "regime": regime_name,
+                            "metric": metric_label,
+                            "slope": float(coef[0]),
+                            "r2": float(r2_score(yr, np.polyval(coef, xr))),
+                            "mean_value": float(np.mean(yr)),
+                        }
+                    )
+
+            lin = np.polyfit(x, y, 1)
+            quad = np.polyfit(x, y, 2)
+            cubic = np.polyfit(x, y, 3)
+            pw = piecewise_linear_two_segment(x, y)
+
+            model_compare_rows.extend([
+                {"condition": cond_name, "condition_label": label, "metric": metric_label, "model": "linear", "r2": float(r2_score(y, np.polyval(lin, x)))},
+                {"condition": cond_name, "condition_label": label, "metric": metric_label, "model": "quadratic", "r2": float(r2_score(y, np.polyval(quad, x)))},
+                {"condition": cond_name, "condition_label": label, "metric": metric_label, "model": "cubic", "r2": float(r2_score(y, np.polyval(cubic, x)))},
+                {"condition": cond_name, "condition_label": label, "metric": metric_label, "model": "piecewise_linear", "r2": float(pw["r2"])},
+            ])
+
+    local_df = pd.DataFrame(local_rows)
+    turning_df = pd.DataFrame(turning_rows)
+    regime_df = pd.DataFrame(regime_rows)
+    model_compare_df = pd.DataFrame(model_compare_rows)
+
+    local_df.to_csv(os.path.join(OUTDIR, "nonlinear_local_slopes_summary.csv"), index=False)
+    turning_df.to_csv(os.path.join(OUTDIR, "nonlinear_turning_points_summary.csv"), index=False)
+    regime_df.to_csv(os.path.join(OUTDIR, "nonlinear_regime_summary.csv"), index=False)
+    model_compare_df.to_csv(os.path.join(OUTDIR, "nonlinear_model_comparison_summary.csv"), index=False)
+
+    return local_df, turning_df, regime_df, model_compare_df
+
+
+# ============================================================
+# Trialwise structure metrics
+# ============================================================
+def compute_trialwise_structure_metrics(trial_df):
+    rows = []
+
+    for cond_name, sub in trial_df.groupby("condition"):
+        meta = sub.iloc[0]
+        for trial, ts in sub.groupby("trial"):
+            ts = ts.sort_values("delta_f")
+            x = np.log10(ts["delta_f"].values)
+
+            for metric_label, col in [("lag_mean", "mean_phase_lag"), ("plv_mean", "plv")]:
+                y = ts[col].values
+                mids, slopes = local_slopes(x, y)
+
+                sign_change_count = 0
+                for i in range(1, len(slopes)):
+                    s1 = np.sign(slopes[i - 1])
+                    s2 = np.sign(slopes[i])
+                    if s1 != 0 and s2 != 0 and s1 != s2:
+                        sign_change_count += 1
+
+                high_mask = mids > 0.0
+                positive_high = slopes[high_mask] > 0 if np.any(high_mask) else np.array([], dtype=bool)
+                positive_high_len = longest_contiguous_true(positive_high)
+
+                lin = np.polyfit(x, y, 1)
+                cubic = np.polyfit(x, y, 3)
+                pw = piecewise_linear_two_segment(x, y)
+
+                r2_lin = r2_score(y, np.polyval(lin, x))
+                r2_cubic = r2_score(y, np.polyval(cubic, x))
+                r2_piece = float(pw["r2"])
+
+                reg_slopes = {}
+                for regime_name, (lo, hi) in REGIME_BINS.items():
+                    if regime_name == "low":
+                        mask = (x >= lo) & (x <= hi)
+                    else:
+                        mask = (x > lo) & (x <= hi)
+                    if mask.sum() >= 3:
+                        xr = x[mask]
+                        yr = y[mask]
+                        coef = np.polyfit(xr, yr, 1)
+                        reg_slopes[regime_name] = float(coef[0])
+
+                low_mid_diff = np.nan
+                mid_high_diff = np.nan
+                if "low" in reg_slopes and "mid" in reg_slopes:
+                    low_mid_diff = reg_slopes["mid"] - reg_slopes["low"]
+                if "mid" in reg_slopes and "high" in reg_slopes:
+                    mid_high_diff = reg_slopes["high"] - reg_slopes["mid"]
+
+                rows.append(
+                    {
+                        "condition": cond_name,
+                        "condition_label": meta["condition_label"],
+                        "asymmetry": int(meta["asymmetry"]),
+                        "adaptation": int(meta["adaptation"]),
+                        "timescale_separation": int(meta["timescale_separation"]),
+                        "trial": int(trial),
+                        "metric": metric_label,
+                        "sign_change_count": int(sign_change_count),
+                        "positive_high_len": int(positive_high_len),
+                        "R2_linear": float(r2_lin),
+                        "R2_cubic": float(r2_cubic),
+                        "R2_piecewise": float(r2_piece),
+                        "delta_R2_cubic_minus_linear": float(r2_cubic - r2_lin),
+                        "delta_R2_piecewise_minus_linear": float(r2_piece - r2_lin),
+                        "slope_diff_low_to_mid": float(low_mid_diff) if not np.isnan(low_mid_diff) else np.nan,
+                        "slope_diff_mid_to_high": float(mid_high_diff) if not np.isnan(mid_high_diff) else np.nan,
+                    }
+                )
+
+    structure_df = pd.DataFrame(rows)
+    structure_df.to_csv(os.path.join(OUTDIR, "trialwise_structure_metrics.csv"), index=False)
+    return structure_df
+
+
+# ============================================================
+# Non-monotonic checks
+# ============================================================
+def run_transition_checks(trial_df, local_df, regime_df):
+    rows = []
+
+    for human_name, cond_name in MAIN_FOUR.items():
+        full_trial_sub = trial_df[trial_df["condition"] == cond_name].copy()
+
+        for primary_metric, trial_col in [("lag_mean", "mean_phase_lag"), ("plv_mean", "plv")]:
+            loc = local_df[(local_df["condition"] == cond_name) & (local_df["metric"] == primary_metric)].copy()
+            reg = regime_df[(regime_df["condition"] == cond_name) & (regime_df["metric"] == primary_metric)].copy()
+
+            loc = loc.sort_values("mid_log10_delta_f")
+            slopes = loc["local_slope"].values
+            mids = loc["mid_log10_delta_f"].values
+
+            sign_changes = 0
+            for i in range(1, len(slopes)):
+                s1 = np.sign(slopes[i - 1])
+                s2 = np.sign(slopes[i])
+                if s1 != 0 and s2 != 0 and s1 != s2:
+                    sign_changes += 1
+
+            high_mask = mids > 0.0
+            pos_high = slopes[high_mask] > 0 if np.any(high_mask) else np.array([], dtype=bool)
+            contiguous_positive_high_len = longest_contiguous_true(pos_high)
+            criterion_1 = contiguous_positive_high_len >= 1
+
+            reg_map = {r["regime"]: r["slope"] for _, r in reg.iterrows()}
+            criterion_2 = False
+            if "low" in reg_map and "mid" in reg_map:
+                if np.sign(reg_map["low"]) != np.sign(reg_map["mid"]) or abs(reg_map["low"] - reg_map["mid"]) > 1e-10:
+                    criterion_2 = True
+            if "mid" in reg_map and "high" in reg_map:
+                if np.sign(reg_map["mid"]) != np.sign(reg_map["high"]) or abs(reg_map["mid"] - reg_map["high"]) > 1e-10:
+                    criterion_2 = True
+
+            trial_repro_flags = []
+            for trial, sub in full_trial_sub.groupby("trial"):
+                sub = sub.sort_values("delta_f")
+                x = np.log10(sub["delta_f"].values)
+                y = sub[trial_col].values
+                _, slopes_t = local_slopes(x, y)
+                sc = 0
+                for i in range(1, len(slopes_t)):
+                    s1 = np.sign(slopes_t[i - 1])
+                    s2 = np.sign(slopes_t[i])
+                    if s1 != 0 and s2 != 0 and s1 != s2:
+                        sc += 1
+                trial_repro_flags.append(sc >= 1)
+
+            reproducibility_rate = float(np.mean(trial_repro_flags)) if len(trial_repro_flags) > 0 else np.nan
+            criterion_3 = reproducibility_rate >= 0.5
+
+            secondary_support = []
+            for sec_metric in ["mean_domega_eff_mean", "D_phi_mean", "r_slip_mean"]:
+                sec_loc = local_df[(local_df["condition"] == cond_name) & (local_df["metric"] == sec_metric)].copy()
+                sec_reg = regime_df[(regime_df["condition"] == cond_name) & (regime_df["metric"] == sec_metric)].copy()
+
+                sec_loc = sec_loc.sort_values("mid_log10_delta_f")
+                sec_slopes = sec_loc["local_slope"].values
+                sec_mids = sec_loc["mid_log10_delta_f"].values
+                sec_high_mask = sec_mids > 0.0
+                sec_pos_high = sec_slopes[sec_high_mask] > 0 if np.any(sec_high_mask) else np.array([], dtype=bool)
+
+                sec_reg_map = {r["regime"]: r["slope"] for _, r in sec_reg.iterrows()}
+                sec_change = False
+                if "mid" in sec_reg_map and "high" in sec_reg_map:
+                    if np.sign(sec_reg_map["mid"]) != np.sign(sec_reg_map["high"]) or abs(sec_reg_map["mid"] - sec_reg_map["high"]) > 1e-10:
+                        sec_change = True
+
+                sec_support = (longest_contiguous_true(sec_pos_high) >= 1) or sec_change
+                secondary_support.append((sec_metric, sec_support))
+
+            criterion_4 = any(flag for _, flag in secondary_support)
+
+            rows.append(
+                {
+                    "condition": cond_name,
+                    "condition_group": human_name,
+                    "primary_metric": primary_metric,
+                    "n_sign_changes": int(sign_changes),
+                    "contiguous_positive_high_len": int(contiguous_positive_high_len),
+                    "criterion_1_positive_interval_high": bool(criterion_1),
+                    "criterion_2_regime_change": bool(criterion_2),
+                    "reproducibility_rate": reproducibility_rate,
+                    "criterion_3_reproducible": bool(criterion_3),
+                    "secondary_support_details": "; ".join([f"{m}:{int(v)}" for m, v in secondary_support]),
+                    "criterion_4_secondary_change": bool(criterion_4),
+                    "all_criteria_satisfied": bool(criterion_1 and criterion_2 and criterion_3 and criterion_4),
+                }
+            )
+
+    checks_df = pd.DataFrame(rows)
+    checks_df.to_csv(os.path.join(OUTDIR, "nonmonotonic_transition_checks.csv"), index=False)
+    return checks_df
+
+
+# ============================================================
+# Factorial analysis
+# ============================================================
+def ols_with_inference(df: pd.DataFrame, ycol: str):
+    X = pd.DataFrame({
+        "Intercept": np.ones(len(df), dtype=float),
+        "A": df["asymmetry"].astype(float).values,
+        "G": df["adaptation"].astype(float).values,
+        "T": df["timescale_separation"].astype(float).values,
+    })
+    X["AG"] = X["A"] * X["G"]
+    X["AT"] = X["A"] * X["T"]
+    X["GT"] = X["G"] * X["T"]
+    X["AGT"] = X["A"] * X["G"] * X["T"]
+
+    y = df[ycol].astype(float).values
+    Xmat = X.values
+
+    beta, _, _, _ = np.linalg.lstsq(Xmat, y, rcond=None)
+    yhat = Xmat @ beta
+    resid = y - yhat
+
+    n = len(y)
+    p = Xmat.shape[1]
+    df_resid = n - p
+    ss_res = np.sum(resid ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    xtx_inv = np.linalg.inv(Xmat.T @ Xmat)
+    sigma2 = ss_res / df_resid if df_resid > 0 else np.nan
+    se = np.sqrt(np.diag(xtx_inv) * sigma2) if df_resid > 0 else np.full(p, np.nan)
+
+    if df_resid > 0:
+        tvals = beta / se
+        pvals = 2.0 * (1.0 - student_t.cdf(np.abs(tvals), df=df_resid))
+        tcrit = student_t.ppf(0.975, df=df_resid)
+        ci_low = beta - tcrit * se
+        ci_high = beta + tcrit * se
+    else:
+        tvals = np.full(p, np.nan)
+        pvals = np.full(p, np.nan)
+        ci_low = np.full(p, np.nan)
+        ci_high = np.full(p, np.nan)
+
+    out = pd.DataFrame({
+        "term": X.columns,
+        "beta": beta,
+        "se": se,
+        "t": tvals,
+        "p": pvals,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "r2_model": r2,
+        "n": n,
+        "df_resid": df_resid,
+        "response": ycol,
+    })
+    return out
+
+
+def run_factorial_analyses(sens_df, structure_df):
+    sens_out = []
+    for ycol in ["S_LAG", "S_PLV", "S_DOMEGA", "S_DPHI", "S_RSLIP"]:
+        sens_out.append(ols_with_inference(sens_df, ycol))
+    factorial_sens_df = pd.concat(sens_out, ignore_index=True)
+    factorial_sens_df.to_csv(os.path.join(OUTDIR, "factorial_effects_trialwise_sensitivity.csv"), index=False)
+
+    struct_out = []
+    lag_struct = structure_df[structure_df["metric"] == "lag_mean"].copy()
+    for ycol in [
+        "sign_change_count",
+        "positive_high_len",
+        "delta_R2_cubic_minus_linear",
+        "delta_R2_piecewise_minus_linear",
+        "slope_diff_low_to_mid",
+        "slope_diff_mid_to_high",
+    ]:
+        struct_out.append(ols_with_inference(lag_struct, ycol))
+    factorial_struct_df = pd.concat(struct_out, ignore_index=True)
+    factorial_struct_df.to_csv(os.path.join(OUTDIR, "factorial_effects_trialwise_structure.csv"), index=False)
+
+    return factorial_sens_df, factorial_struct_df
+
+
+# ============================================================
+# Parameter robustness
+# ============================================================
+def run_parameter_robustness():
+    rows = []
+    full = Condition(1, 1, 1)
+    reduced_variants = {
+        "Full": full,
+        "NoAsym": Condition(0, 1, 1),
+        "NoAdapt": Condition(1, 0, 1),
+        "NoTSsep": Condition(1, 1, 0),
+    }
+
+    sweep_specs = {
+        "alpha": ALPHA_SWEEP,
+        "g": G_SWEEP,
+        "tau_a": TAU_A_SWEEP,
+        "c": C_SWEEP,
+    }
+
+    for sweep_name, sweep_values in sweep_specs.items():
+        print(f"Robustness sweep: {sweep_name}")
+        for sweep_value in sweep_values:
+            for label, cond in reduced_variants.items():
+                for trial in range(20):
+                    lag_values = []
+                    plv_values = []
+                    domega_values = []
+                    dphi_values = []
+                    rslip_values = []
+
+                    for delta_f in DELTA_F_VALUES:
+                        kwargs = {}
+                        if sweep_name == "alpha":
+                            kwargs["alpha_on"] = sweep_value
+                        elif sweep_name == "g":
+                            kwargs["g_on"] = sweep_value
+                        elif sweep_name == "tau_a":
+                            kwargs["tau_a_on"] = sweep_value
+                        elif sweep_name == "c":
+                            kwargs["c_on"] = sweep_value
+
+                        seed = trial_seed("robust", sweep_name, sweep_value, label, delta_f, trial)
+                        res = simulate_condition(cond, float(delta_f), seed, **kwargs)
+
+                        lag_values.append(res["mean_phase_lag"])
+                        plv_values.append(res["plv"])
+                        domega_values.append(res["mean_domega_eff"])
+                        dphi_values.append(res["D_phi"])
+                        rslip_values.append(res["r_slip"])
+
+                    x = np.log10(DELTA_F_VALUES)
+                    coef_lag = np.polyfit(x, np.asarray(lag_values), 1)
+                    coef_plv = np.polyfit(x, np.asarray(plv_values), 1)
+                    coef_domega = np.polyfit(x, np.asarray(domega_values), 1)
+                    coef_dphi = np.polyfit(x, np.asarray(dphi_values), 1)
+                    coef_rslip = np.polyfit(x, np.asarray(rslip_values), 1)
+
+                    rows.append(
+                        {
+                            "sweep_parameter": sweep_name,
+                            "sweep_value": float(sweep_value),
+                            "condition": label,
+                            "S_LAG": float(coef_lag[0]),
+                            "S_PLV": float(coef_plv[0]),
+                            "S_DOMEGA": float(coef_domega[0]),
+                            "S_DPHI": float(coef_dphi[0]),
+                            "S_RSLIP": float(coef_rslip[0]),
+                        }
+                    )
+
+    robust_df = pd.DataFrame(rows)
+    robust_df.to_csv(os.path.join(OUTDIR, "parameter_robustness_trialwise.csv"), index=False)
+
+    robust_summary = (
+        robust_df.groupby(["sweep_parameter", "sweep_value", "condition"], as_index=False)
+        .agg(
+            S_LAG_mean=("S_LAG", "mean"),
+            S_PLV_mean=("S_PLV", "mean"),
+            S_DOMEGA_mean=("S_DOMEGA", "mean"),
+            S_DPHI_mean=("S_DPHI", "mean"),
+            S_RSLIP_mean=("S_RSLIP", "mean"),
+        )
+    )
+    robust_summary.to_csv(os.path.join(OUTDIR, "parameter_robustness_summary.csv"), index=False)
+    return robust_df, robust_summary
+
+
+# ============================================================
+# dt convergence
+# ============================================================
+def run_dt_convergence():
+    rows = []
+    full = Condition(1, 1, 1)
+
+    for dt_test in [DT, DT / 2.0]:
+        for trial in range(10):
+            seed = trial_seed("dt", dt_test, trial)
+            res = simulate_condition(full, REPRESENTATIVE_DELTA_F, seed, dt=dt_test, t_total=15.0)
+            rows.append(
+                {
+                    "dt": float(dt_test),
+                    "trial": int(trial),
+                    "plv": float(res["plv"]),
+                    "mean_phase_lag": float(res["mean_phase_lag"]),
+                    "mean_domega_eff": float(res["mean_domega_eff"]),
+                    "D_phi": float(res["D_phi"]),
+                    "r_slip": float(res["r_slip"]),
+                }
+            )
+
+    dt_df = pd.DataFrame(rows)
+    dt_df.to_csv(os.path.join(OUTDIR, "dt_convergence_metrics.csv"), index=False)
+    return dt_df
+
+
+# ============================================================
+# Figures
+# ============================================================
+def plot_main_four_curves(summary_df):
+    for metric_col, ylab, title, fname in [
+        ("lag_mean", "Mean phase lag (rad)", "Figure 1. Mean phase lag across mismatch levels", "Figure1_main4_lag_curves.png"),
+        ("plv_mean", "PLV", "Figure 2. PLV across mismatch levels", "Figure2_main4_plv_curves.png"),
+        ("mean_domega_eff_mean", "Mean effective angular velocity difference", "Figure 6. Mean effective angular velocity difference", "Figure6_main4_domega_curves.png"),
+        ("D_phi_mean", "Phase diffusion coefficient", "Figure 7. Phase diffusion", "Figure7_main4_dphi_curves.png"),
+        ("r_slip_mean", "Phase-slip rate", "Figure 8. Phase-slip rate", "Figure8_main4_rslip_curves.png"),
+    ]:
+        plt.figure(figsize=(8.5, 5.5))
+        for label, cond_name in MAIN_FOUR.items():
+            sub = summary_df[summary_df["condition"] == cond_name].sort_values("log10_delta_f")
+            if len(sub) == 0:
+                continue
+            plt.plot(sub["log10_delta_f"], sub[metric_col], marker="o", linewidth=1.8, label=label)
+        plt.xlabel("log10(Delta f [Hz])")
+        plt.ylabel(ylab)
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTDIR, fname), dpi=300)
+        plt.close()
+
+
+def plot_local_slopes(local_df):
+    plt.figure(figsize=(8.5, 5.5))
+    for label, cond_name in MAIN_FOUR.items():
+        sub = local_df[(local_df["condition"] == cond_name) & (local_df["metric"] == "lag_mean")].sort_values("mid_log10_delta_f")
+        if len(sub) == 0:
+            continue
+        plt.plot(sub["mid_log10_delta_f"], sub["local_slope"], marker="o", linewidth=1.8, label=label)
+    plt.axhline(0.0, linewidth=1.0)
+    plt.xlabel("Midpoint log10(Delta f [Hz])")
+    plt.ylabel("Local slope of mean phase lag")
+    plt.title("Figure 3. Local slopes of the phase-lag response")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "Figure3_main4_local_slopes_lag.png"), dpi=300)
+    plt.close()
+
+
+def plot_regime_slopes(regime_df):
+    plt.figure(figsize=(8.5, 5.5))
+    regimes = ["low", "mid", "high"]
+    x0 = np.arange(len(regimes))
+    width = 0.18
+    for idx, (label, cond_name) in enumerate(MAIN_FOUR.items()):
+        sub = regime_df[(regime_df["condition"] == cond_name) & (regime_df["metric"] == "lag_mean")].set_index("regime").reindex(regimes)
+        if len(sub) == 0:
+            continue
+        plt.bar(x0 + idx * width, sub["slope"].values, width=width, label=label)
+    plt.xticks(x0 + 1.5 * width, regimes)
+    plt.ylabel("Regime-specific slope")
+    plt.title("Figure 4. Regime-specific phase-lag slopes")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "Figure4_main4_regime_slopes_lag.png"), dpi=300)
+    plt.close()
+
+
+def plot_model_comparison(model_compare_df):
+    sub = model_compare_df[(model_compare_df["condition"] == MAIN_FOUR["Full"]) & (model_compare_df["metric"] == "lag_mean")]
+    plt.figure(figsize=(7.0, 4.8))
+    plt.bar(sub["model"], sub["r2"])
+    plt.ylabel("R2")
+    plt.title("Figure 5. Model comparison in the Full condition")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "Figure5_full_model_comparison_lag.png"), dpi=300)
+    plt.close()
+
+
+def plot_conditionwise_global_slopes(condition_df):
+    tmp = condition_df[condition_df["condition"].isin(MAIN_FOUR.values())].copy()
+    order = [MAIN_FOUR["Full"], MAIN_FOUR["NoAsym"], MAIN_FOUR["NoAdapt"], MAIN_FOUR["NoTSsep"]]
+    tmp["order"] = tmp["condition"].map({k: i for i, k in enumerate(order)})
+    tmp = tmp.sort_values("order")
+    labels = ["Full", "NoAsym", "NoAdapt", "NoTSsep"]
+    x = np.arange(len(tmp))
+    y = tmp["S_LAG_mean"].values
+    yerr = np.vstack([y - tmp["S_LAG_CI_low"].values, tmp["S_LAG_CI_high"].values - y])
+
+    plt.figure(figsize=(7.5, 5.0))
+    plt.bar(x, y)
+    plt.errorbar(x, y, yerr=yerr, fmt="none", capsize=4)
+    plt.xticks(x, labels)
+    plt.ylabel("Global slope of mean phase lag")
+    plt.title("Figure 9. Global phase-lag slopes in the four main conditions")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "Figure9_main4_global_slopes_lag.png"), dpi=300)
+    plt.close()
+
+
+def plot_factorial_bars(factorial_df, response, title, fname):
+    sub = factorial_df[factorial_df["response"] == response].copy()
+    terms = ["A", "G", "T", "AG", "AT", "GT", "AGT"]
+    sub = sub.set_index("term").reindex(terms).reset_index()
+
+    x = np.arange(len(sub))
+    y = sub["beta"].values
+    yerr = np.vstack([y - sub["ci_low"].values, sub["ci_high"].values - y])
+
+    plt.figure(figsize=(8.5, 5.0))
+    plt.bar(x, y)
+    plt.errorbar(x, y, yerr=yerr, fmt="none", capsize=4)
+    plt.xticks(x, terms)
+    plt.ylabel("Coefficient")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, fname), dpi=300)
+    plt.close()
+
+
+def plot_robustness(robust_summary):
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), constrained_layout=True)
+    for ax, sweep_name in zip(axes.ravel(), ["alpha", "g", "tau_a", "c"]):
+        sub = robust_summary[
+            (robust_summary["sweep_parameter"] == sweep_name) &
+            (robust_summary["condition"].isin(["Full", "NoAsym", "NoAdapt", "NoTSsep"]))
+        ]
+        for cond in ["Full", "NoAsym", "NoAdapt", "NoTSsep"]:
+            ss = sub[sub["condition"] == cond]
+            ax.plot(ss["sweep_value"], ss["S_LAG_mean"], marker="o", label=cond)
+        ax.set_xlabel(sweep_name)
+        ax.set_ylabel("Global S_LAG")
+        ax.set_title(f"Robustness across {sweep_name}")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4)
+    plt.savefig(os.path.join(OUTDIR, "FigureS1_parameter_robustness_lag.png"), dpi=300)
+    plt.close()
+
+
+def plot_dt_convergence(dt_df):
+    dt_summary = dt_df.groupby("dt", as_index=False).agg(
+        plv_mean=("plv", "mean"),
+        lag_mean=("mean_phase_lag", "mean"),
+        domega_mean=("mean_domega_eff", "mean"),
+        dphi_mean=("D_phi", "mean"),
+        rslip_mean=("r_slip", "mean"),
+    )
+    plt.figure(figsize=(7.0, 4.8))
+    plt.plot(dt_summary["dt"], dt_summary["plv_mean"], marker="o", label="PLV")
+    plt.plot(dt_summary["dt"], dt_summary["lag_mean"], marker="o", label="Mean phase lag")
+    plt.plot(dt_summary["dt"], dt_summary["domega_mean"], marker="o", label="Mean Δω_eff")
+    plt.xlabel("dt (s)")
+    plt.ylabel("Metric value")
+    plt.title("Figure S2. dt convergence check")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "FigureS2_dt_convergence.png"), dpi=300)
+    plt.close()
+
+
+def plot_representative_timeseries(representative):
+    if representative is None:
+        return
+    n_show = int(round(4.0 / DT))
+    plt.figure(figsize=(10.0, 4.2))
+    plt.plot(representative["time_ss"][:n_show], representative["x_l_ss"][:n_show], label="Left unit")
+    plt.plot(representative["time_ss"][:n_show], representative["x_r_ss"][:n_show], label="Right unit")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Activity")
+    plt.title("Figure S3. Representative Full-condition dynamics at Delta f = 0.1 Hz")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, "FigureS3_representative_timeseries.png"), dpi=300)
+    plt.close()
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    print(f"Output directory: {OUTDIR}")
+
+    trial_df, summary_df, sens_df, condition_df, factor_df, representative = run_main_analysis()
+    local_df, turning_df, regime_df, model_compare_df = run_nonlinear_analyses(summary_df, trial_df)
+    structure_df = compute_trialwise_structure_metrics(trial_df)
+    checks_df = run_transition_checks(trial_df, local_df, regime_df)
+    factorial_sens_df, factorial_struct_df = run_factorial_analyses(sens_df, structure_df)
+    robust_df, robust_summary = run_parameter_robustness()
+    dt_df = run_dt_convergence()
+
+    plot_main_four_curves(summary_df)
+    plot_local_slopes(local_df)
+    plot_regime_slopes(regime_df)
+    plot_model_comparison(model_compare_df)
+    plot_conditionwise_global_slopes(condition_df)
+    plot_factorial_bars(
+        factorial_sens_df,
+        "S_LAG",
+        "Figure 10. Factorial coefficients for global phase-lag slope",
+        "Figure10_factorial_effects_S_LAG.png",
+    )
+    plot_factorial_bars(
+        factorial_struct_df,
+        "delta_R2_piecewise_minus_linear",
+        "Figure 11. Factorial coefficients for piecewise-minus-linear improvement",
+        "Figure11_factorial_effects_structure_piecewise_minus_linear.png",
+    )
+    plot_robustness(robust_summary)
+    plot_dt_convergence(dt_df)
+    plot_representative_timeseries(representative)
+
+    params = {
+        "TAU_X": TAU_X,
+        "TAU_A_ON": TAU_A_ON,
+        "W0": W0,
+        "C_ON": C_ON,
+        "ALPHA_ON": ALPHA_ON,
+        "G_ON": G_ON,
+        "GAMMA": GAMMA,
+        "THETA": THETA,
+        "TAU_DELAY": TAU_DELAY,
+        "A_IN": A_IN,
+        "F0": F0,
+        "SIGMA_ADD": SIGMA_ADD,
+        "DT": DT,
+        "T_TOTAL": T_TOTAL,
+        "T_BURN": T_BURN,
+        "N_TRIALS": N_TRIALS,
+        "BOOT_N": BOOT_N,
+        "DELTA_F_VALUES": DELTA_F_VALUES.tolist(),
+        "ALPHA_SWEEP": ALPHA_SWEEP,
+        "G_SWEEP": G_SWEEP,
+        "TAU_A_SWEEP": TAU_A_SWEEP,
+        "C_SWEEP": C_SWEEP,
+        "REGIME_BINS": REGIME_BINS,
+    }
+    with open(os.path.join(OUTDIR, "analysis_parameters.json"), "w", encoding="utf-8") as f:
+        json.dump(params, f, indent=2)
+
+    print("All analyses completed.")
+    print(f"Saved files in: {OUTDIR}")
+
+
+if __name__ == "__main__":
+    main()
